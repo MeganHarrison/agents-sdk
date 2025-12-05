@@ -1,13 +1,22 @@
 from __future__ import annotations
 
+import json
 import logging
+import os
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Optional
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, Query, Request
+# Load environment variables from root .env file
+from dotenv import load_dotenv
+env_path = Path(__file__).parent.parent / '.env'
+load_dotenv(env_path)
+
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
@@ -47,6 +56,23 @@ from main import (
     triage_agent,
 )
 from memory_store import MemoryStore
+from supabase_helpers import SupabaseRagStore
+from ingestion.fireflies_pipeline import FirefliesIngestionPipeline
+
+# Import RAG workflow components
+try:
+    from alleato_agent_workflow.alleato_agent_workflow import (
+        run_workflow,
+        WorkflowInput,
+        classification_agent as rag_classification_agent,
+        project as rag_project_agent,
+        internal_knowledge_base as rag_knowledge_agent,
+        strategist as rag_strategist_agent,
+    )
+    RAG_AVAILABLE = True
+except ImportError:
+    RAG_AVAILABLE = False
+    print("Warning: RAG workflow not available. Continuing with airline demo only.")
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -80,6 +106,18 @@ class GuardrailCheck(BaseModel):
     reasoning: str
     passed: bool
     timestamp: float
+
+
+class ChatRequest(BaseModel):
+    message: str
+    project_id: Optional[int] = None
+    limit: int = 5
+
+
+class IngestRequest(BaseModel):
+    path: str
+    project_id: Optional[int] = None
+    dry_run: bool = True
 
 
 def _get_agent_by_name(name: str):
@@ -419,6 +457,16 @@ def get_server() -> AirlineServer:
     return server
 
 
+def get_rag_store() -> SupabaseRagStore:
+    return SupabaseRagStore()
+
+
+def get_ingestion_pipeline(
+    store: SupabaseRagStore = Depends(get_rag_store),
+) -> FirefliesIngestionPipeline:
+    return FirefliesIngestionPipeline(store)
+
+
 @app.post("/chatkit")
 async def chatkit_endpoint(
     request: Request, server: AirlineServer = Depends(get_server)
@@ -450,3 +498,299 @@ async def chatkit_bootstrap(
 @app.get("/health")
 async def health_check() -> Dict[str, str]:
     return {"status": "healthy"}
+
+
+# ===== RAG ENDPOINTS =====
+# These endpoints provide RAG-based chat functionality using Alleato agents
+
+# RAG Context management
+@dataclass
+class RagAgentContext:
+    """Context for RAG agent operations"""
+    retrieved_chunks: List[str] = field(default_factory=list)
+    sources: List[str] = field(default_factory=list)
+    confidence_score: float = 0.0
+    query_type: Optional[str] = None
+    current_agent: str = "classification"
+    thread_id: str = field(default_factory=lambda: str(uuid4()))
+
+    def to_dict(self) -> dict:
+        return {
+            "retrieved_chunks": self.retrieved_chunks,
+            "sources": self.sources,
+            "confidence_score": self.confidence_score,
+            "query_type": self.query_type,
+            "current_agent": self.current_agent,
+            "thread_id": self.thread_id,
+        }
+
+@dataclass
+class RagChatContext:
+    """Complete chat context including agents and events"""
+    context: RagAgentContext
+    agents: List[str] = field(default_factory=list)
+    events: List[dict] = field(default_factory=list)
+    guardrails: List[dict] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "context": self.context.to_dict(),
+            "agents": self.agents,
+            "events": self.events,
+            "guardrails": self.guardrails,
+        }
+
+def create_initial_rag_context() -> RagAgentContext:
+    """Create initial RAG context"""
+    return RagAgentContext()
+
+# Memory store for RAG threads - simple dictionary storage
+rag_memory_store: Dict[str, RagChatContext] = {}
+
+
+@app.post("/rag-chatkit")
+async def rag_chatkit_endpoint(request: Request):
+    """Main RAG ChatKit endpoint"""
+    if not RAG_AVAILABLE:
+        return Response(
+            content='{"error": "RAG workflow not available"}',
+            status_code=503,
+            media_type="application/json"
+        )
+
+    payload = await request.body()
+    payload_json = json.loads(payload)
+
+    thread_id = payload_json.get("thread_id") or str(uuid4())
+    messages = payload_json.get("messages", [])
+
+    # Get or create thread context
+    if thread_id not in rag_memory_store:
+        chat_context = RagChatContext(context=create_initial_rag_context())
+        rag_memory_store[thread_id] = chat_context
+    else:
+        chat_context = rag_memory_store[thread_id]
+
+    # Extract last user message
+    user_input = ""
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            content = msg.get("content", [])
+            for item in content:
+                if item.get("type") == "text":
+                    user_input = item.get("text", "")
+                    break
+            if user_input:
+                break
+
+    # Log the event
+    event = {
+        "type": "message",
+        "timestamp": datetime.now().isoformat(),
+        "agent": chat_context.context.current_agent,
+        "message": user_input,
+    }
+    chat_context.events.append(event)
+
+    try:
+        # Run the workflow
+        workflow_input = WorkflowInput(input_as_text=user_input)
+        result = await run_workflow(workflow_input)
+
+        # Parse result
+        if isinstance(result, dict):
+            if "pii" in result or "jailbreak" in result:
+                chat_context.guardrails.append({
+                    "type": "guardrail_triggered",
+                    "timestamp": datetime.now().isoformat(),
+                    "details": result,
+                })
+                response_text = "I cannot process this request due to policy violations."
+            else:
+                response_text = result.get("safe_text", str(result))
+        else:
+            response_text = str(result)
+
+        # Update context
+        if "project" in response_text.lower():
+            chat_context.context.current_agent = "project"
+        elif "policy" in response_text.lower():
+            chat_context.context.current_agent = "internal_knowledge"
+        elif "strategic" in response_text.lower():
+            chat_context.context.current_agent = "strategist"
+
+        # Update memory
+        rag_memory_store[thread_id] = chat_context
+
+        # Return response
+        return Response(
+            content=json.dumps({
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": response_text}]
+                    }
+                ],
+                "thread_id": thread_id
+            }),
+            media_type="application/json"
+        )
+
+    except Exception as e:
+        logger.error(f"Error in RAG workflow: {e}")
+        return Response(
+            content=json.dumps({
+                "error": f"Error processing request: {str(e)}"
+            }),
+            status_code=500,
+            media_type="application/json"
+        )
+
+
+@app.get("/rag-chatkit/state")
+async def get_rag_state(thread_id: str = Query(...)):
+    """Get current RAG conversation state"""
+    if not RAG_AVAILABLE:
+        return {"error": "RAG workflow not available"}
+
+    if thread_id in rag_memory_store:
+        chat_context = rag_memory_store[thread_id]
+        return {
+            "thread_id": thread_id,
+            "current_agent": chat_context.context.current_agent,
+            "agents": chat_context.agents,
+            "events": chat_context.events,
+            "guardrails": chat_context.guardrails,
+            "context": chat_context.context.to_dict(),
+        }
+    else:
+        return {
+            "thread_id": thread_id,
+            "current_agent": None,
+            "agents": [],
+            "events": [],
+            "guardrails": [],
+            "context": {},
+        }
+
+
+@app.get("/rag-chatkit/bootstrap")
+async def rag_bootstrap():
+    """Bootstrap a new RAG conversation"""
+    if not RAG_AVAILABLE:
+        return {"error": "RAG workflow not available"}
+
+    thread_id = str(uuid4())
+    context = create_initial_rag_context()
+    context.thread_id = thread_id
+
+    chat_context = RagChatContext(context=context)
+    chat_context.agents = ["classification"]
+
+    rag_memory_store[thread_id] = chat_context
+
+    return {
+        "thread_id": thread_id,
+        "current_agent": "classification",
+        "agents": chat_context.agents,
+        "events": [],
+        "guardrails": [],
+        "context": context.to_dict(),
+    }
+
+
+def _select_keyword(message: str) -> Optional[str]:
+    words = re.findall(r"[A-Za-z]+", message.lower())
+    for word in words:
+        if len(word) >= 4:
+            return word
+    return None
+
+
+def _build_chat_reply(
+    message: str,
+    store: SupabaseRagStore,
+    project_id: Optional[int],
+    limit: int = 5,
+) -> Dict[str, Any]:
+    keyword = _select_keyword(message)
+    chunks = store.search_chunks_by_keyword(keyword, project_id=project_id, limit=limit)
+    if not chunks:
+        chunks = store.fetch_recent_chunks(project_id=project_id, limit=limit)
+
+    tasks = store.list_tasks(project_id=project_id, status="open", limit=limit)
+    insights = store.list_insights(project_id=project_id, limit=limit)
+    project = store.get_project(project_id) if project_id is not None else None
+
+    sources = [
+        {
+            "document_id": chunk.get("document_id"),
+            "chunk_index": chunk.get("chunk_index") or (chunk.get("metadata") or {}).get("chunk_index"),
+            "snippet": (chunk.get("text") or "")[:280],
+            "metadata": chunk.get("metadata") or {},
+        }
+        for chunk in chunks
+    ]
+
+    reply_lines: List[str] = []
+    if project:
+        reply_lines.append(
+            f"Project {project.get('name', project_id)} has {project.get('meeting_count', 0)} documented meetings and {project.get('open_tasks', 0)} open AI tasks."
+        )
+    if tasks:
+        reply_lines.append(
+            "Top open tasks: " + "; ".join(task.get("title", "Task") for task in tasks[:3])
+        )
+    if insights:
+        reply_lines.append(
+            "Recent insights: " + "; ".join(insight.get("summary", "")[:80] for insight in insights[:3])
+        )
+    if sources:
+        reply_lines.append(
+            f"Retrieved {len(sources)} transcript snippets based on the keyword '{keyword or 'recent'}'."
+        )
+    if not reply_lines:
+        reply_lines.append(
+            "No relevant transcripts or tasks were found yet. Try ingesting more Fireflies meetings or widening your query."
+        )
+
+    return {
+        "reply": "\n".join(reply_lines),
+        "sources": sources,
+        "tasks": tasks,
+        "insights": insights,
+    }
+
+
+# === Alleato REST API ===
+
+
+@app.get("/api/projects")
+def list_projects_api(store: SupabaseRagStore = Depends(get_rag_store)) -> Dict[str, Any]:
+    return {"projects": store.list_projects()}
+
+
+@app.get("/api/projects/{project_id}")
+def project_detail_api(project_id: int, store: SupabaseRagStore = Depends(get_rag_store)) -> Dict[str, Any]:
+    project = store.get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    tasks = store.list_tasks(project_id=project_id, status="open", limit=50)
+    insights = store.list_insights(project_id=project_id, limit=20)
+    return {"project": project, "tasks": tasks, "insights": insights}
+
+
+@app.post("/api/chat")
+def rag_chat_api(payload: ChatRequest, store: SupabaseRagStore = Depends(get_rag_store)) -> Dict[str, Any]:
+    if not payload.message.strip():
+        raise HTTPException(status_code=422, detail="Message cannot be empty")
+    return _build_chat_reply(payload.message, store=store, project_id=payload.project_id, limit=payload.limit)
+
+
+@app.post("/api/ingest/fireflies")
+def ingest_fireflies_endpoint(
+    payload: IngestRequest,
+    pipeline: FirefliesIngestionPipeline = Depends(get_ingestion_pipeline),
+) -> Dict[str, Any]:
+    result = pipeline.ingest_file(payload.path, project_id=payload.project_id, dry_run=payload.dry_run)
+    return {"result": result.__dict__}

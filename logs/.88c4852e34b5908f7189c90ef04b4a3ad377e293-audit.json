@@ -1,0 +1,20 @@
+{
+    "keep": {
+        "days": true,
+        "amount": 14
+    },
+    "auditLog": "/Users/meganharrison/Documents/github/agents-sdk/logs/.88c4852e34b5908f7189c90ef04b4a3ad377e293-audit.json",
+    "files": [
+        {
+            "date": 1764892931801,
+            "name": "/Users/meganharrison/Documents/github/agents-sdk/logs/mcp-puppeteer-2025-12-04.log",
+            "hash": "a1581511fee07597455163cb5e7cd6a98ed7d97f9317427332f494623953a4e9"
+        },
+        {
+            "date": 1764910865751,
+            "name": "/Users/meganharrison/Documents/github/agents-sdk/logs/mcp-puppeteer-2025-12-05.log",
+            "hash": "9ad702526b62c43dff7202bad1c9a01d89c7de503713828d7521b734ba2f39fa"
+        }
+    ],
+    "hashType": "sha256"
+}

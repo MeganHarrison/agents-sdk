@@ -1,5 +1,7 @@
 openai-agents
 openai-chatkit
+openai
 pydantic
 fastapi
 uvicorn
+supabase

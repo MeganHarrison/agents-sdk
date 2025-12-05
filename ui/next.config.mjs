@@ -16,6 +16,15 @@ const nextConfig = {
         source: "/chatkit/:path*",
         destination: "http://127.0.0.1:8000/chatkit/:path*",
       },
+      // RAG-specific endpoints
+      {
+        source: "/rag-chatkit",
+        destination: "http://127.0.0.1:8000/rag-chatkit",
+      },
+      {
+        source: "/rag-chatkit/:path*",
+        destination: "http://127.0.0.1:8000/rag-chatkit/:path*",
+      },
     ];
   },
 };

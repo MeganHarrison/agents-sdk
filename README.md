@@ -44,16 +44,10 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-For the UI, you can run:
-
-```bash
-cd ui
-npm install
 ```
-
-### Run the app
-
-You can either run the backend independently if you want to use a separate UI, or run both the UI and backend at the same time.
+cd python-backend
+source .venv/bin/activate
+```
 
 #### Run the backend independently
 
@@ -63,19 +57,32 @@ From the `python-backend` folder, run:
 python -m uvicorn api:app --reload --port 8000
 ```
 
+### Run the app
+
+You can either run the backend independently if you want to use a separate UI, or run both the UI and backend at the same time.
+
 The backend will be available at: [http://localhost:8000](http://localhost:8000)
+
+For the UI, you can run:
+
+```bash
+cd ui
+npm install
+```
 
 #### Run the UI & backend simultaneously
 
 From the `ui` folder, run:
 
 ```bash
+cd ui
 npm run dev
 ```
 
 The frontend will be available at: [http://localhost:3000](http://localhost:3000)
 
 This command will also start the backend.
+
 
 ## Customization
 
